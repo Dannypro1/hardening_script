@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remediate automatable failures from 01-checks-1-.csv (CIS Ubuntu 24.04).
+# Remediate automatable failures from 01-checks-2-.csv (CIS Ubuntu 24.04).
 # Default mode is a read-only preview. Review output before using --apply.
 set -Eeuo pipefail
 
@@ -15,9 +15,9 @@ ENABLE_AUDIT_HARDENING=0
 ENABLE_LOG_PERMISSIONS=0
 FIREWALL_BACKEND="none"
 STRICT_EGRESS=0
+ACKNOWLEDGE_RISK=0
 
 # Site-policy values. Override in the environment or edit before use.
-BANNER_TEXT="${BANNER_TEXT:-Authorized users only. All activity may be monitored and reported.}"
 NTP_SERVERS="${NTP_SERVERS:-}"
 FALLBACK_NTP_SERVERS="${FALLBACK_NTP_SERVERS:-}"
 REMOTE_LOG_HOST="${REMOTE_LOG_HOST:-}"
@@ -49,6 +49,7 @@ The default is a dry run. Options:
   --remove-unused-packages     Purge GDM, rsync, telnet, and FTP clients
   --firewall-backend NAME      none, nftables, ufw, or iptables
   --strict-egress              Use default-deny output policy (high impact)
+  --acknowledge-risk           Required with any high-impact option in apply mode
   -h, --help                    Show this help
 
 The script never reboots or shuts down the host. Audit hardening configures
@@ -57,7 +58,7 @@ CIS disk-full actions and must only be enabled after capacity review.
 Optional environment variables:
   NTP_SERVERS, FALLBACK_NTP_SERVERS, REMOTE_LOG_HOST, REMOTE_LOG_PORT
   JOURNAL_UPLOAD_URL, JOURNAL_SERVER_KEY, JOURNAL_SERVER_CERT
-  JOURNAL_TRUSTED_CERT, GRUB_SUPERUSER, GRUB_PASSWORD_HASH, BANNER_TEXT
+  JOURNAL_TRUSTED_CERT, GRUB_SUPERUSER, GRUB_PASSWORD_HASH
   SSH_PORT, FIREWALL_ALLOW_TCP (space-separated), FIREWALL_ALLOW_UDP
 
 Examples:
@@ -83,6 +84,7 @@ while (($#)); do
       [[ $# -ge 2 ]] || { echo "Missing value for --firewall-backend" >&2; exit 2; }
       FIREWALL_BACKEND="$2"; shift ;;
     --strict-egress) STRICT_EGRESS=1 ;;
+    --acknowledge-risk) ACKNOWLEDGE_RISK=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -90,6 +92,17 @@ while (($#)); do
 done
 
 case "$FIREWALL_BACKEND" in none|nftables|ufw|iptables) ;; *) echo "Invalid firewall backend" >&2; exit 2 ;; esac
+if (( APPLY )) && {
+  (( ENABLE_MOUNT_HARDENING || ENABLE_NETWORK_HARDENING || ENABLE_SSH_HARDENING ||
+     ENABLE_AUDIT_HARDENING || ENABLE_LOG_PERMISSIONS || ENABLE_MODULE_HARDENING ||
+     ENABLE_PAM_HARDENING || ENABLE_APPARMOR || REMOVE_UNUSED_PACKAGES || STRICT_EGRESS )) ||
+  [[ "$FIREWALL_BACKEND" != none ]]
+}; then
+  (( ACKNOWLEDGE_RISK )) || {
+    echo "High-impact options require --acknowledge-risk on this running server." >&2
+    exit 2
+  }
+fi
 (( EUID == 0 )) || { echo "Run as root (sudo)." >&2; exit 1; }
 [[ -r /etc/os-release ]] || { echo "This script requires Ubuntu." >&2; exit 1; }
 . /etc/os-release
@@ -154,6 +167,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 systemd_available() { [[ -d /run/systemd/system ]] && have systemctl; }
 
 log "Mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
+log "Production guard: disruptive categories are opt-in and require --acknowledge-risk when applied."
 (( APPLY )) && mkdir -p "$BACKUP_DIR"
 
 # 35513, 35519-20, 35522-23, 35525-27, 35529-31, 35533-35
@@ -217,7 +231,7 @@ else
   skip "AppArmor enforcement needs --enable-apparmor and application compatibility testing"
 fi
 
-# 35540-41
+# 35540
 if [[ -n "$GRUB_SUPERUSER" && -n "$GRUB_PASSWORD_HASH" ]]; then
   [[ "$GRUB_PASSWORD_HASH" == grub.pbkdf2.* ]] || { echo "GRUB_PASSWORD_HASH is not a GRUB PBKDF2 hash" >&2; exit 1; }
   write_file /etc/grub.d/01_cis_users 0700 "#!/bin/sh
@@ -228,9 +242,7 @@ GRUB_EOF"
 else
   skip "bootloader password needs GRUB_SUPERUSER and GRUB_PASSWORD_HASH"
 fi
-if [[ -e /boot/grub/grub.cfg ]]; then run chown root:root /boot/grub/grub.cfg; run chmod 0400 /boot/grub/grub.cfg; fi
-
-# 35543, 35545, 35547-48
+# 35543, 35545
 write_file /etc/security/limits.d/60-cis-core.conf 0644 '* hard core 0'
 write_file /etc/sysctl.d/60-cis-core.conf 0644 'fs.suid_dumpable = 0'
 if (( ENABLE_NETWORK_HARDENING )); then
@@ -260,8 +272,6 @@ if (( APPLY )); then
 fi
 if [[ -e /etc/default/apport ]]; then replace_setting /etc/default/apport enabled 0 '='; fi
 if systemd_available; then run systemctl disable --now apport.service 2>/dev/null || true; run systemctl mask apport.service 2>/dev/null || true; fi
-write_file /etc/issue 0644 "$BANNER_TEXT"
-write_file /etc/issue.net 0644 "$BANNER_TEXT"
 
 # 35552, 35573, 35585, 35587
 if (( REMOVE_UNUSED_PACKAGES )); then
@@ -287,8 +297,7 @@ else
   skip "time synchronization needs site-approved NTP_SERVERS"
 fi
 
-# 35594, 35600
-[[ -e /etc/crontab ]] && { run chown root:root /etc/crontab; run chmod 0600 /etc/crontab; }
+# 35600
 if [[ -e /etc/cron.deny ]]; then run chown root:root /etc/cron.deny; run chmod 0600 /etc/cron.deny
 else write_file /etc/cron.allow 0640 ''; [[ $(getent group crontab || true) ]] && run chown root:crontab /etc/cron.allow; fi
 
@@ -418,9 +427,8 @@ else
   skip "OpenSSH changes need --enable-ssh-hardening after checking tunnels and client compatibility"
 fi
 
-# 35663-64
-write_file /etc/sudoers.d/00-cis-hardening 0440 'Defaults use_pty
-Defaults logfile="/var/log/sudo.log"'
+# 35664
+write_file /etc/sudoers.d/00-cis-logfile 0440 'Defaults logfile="/var/log/sudo.log"'
 if (( APPLY )) && have visudo; then visudo -cf /etc/sudoers >/dev/null || { echo "sudoers validation failed" >&2; exit 1; }; fi
 
 # 35668, 35672-90. Explicit opt-in because PAM mistakes can deny all logins.
@@ -524,8 +532,7 @@ else
   skip "journal upload needs URL, key, server certificate, and trusted CA values"
 fi
 
-# 35719-21
-write_file /etc/rsyslog.d/60-cis-filemode.conf 0644 '$FileCreateMode 0640'
+# 35720-21
 if [[ -n "$REMOTE_LOG_HOST" ]]; then
   write_file /etc/rsyslog.d/61-cis-forward.conf 0644 "*.* action(type=\"omfwd\" target=\"$REMOTE_LOG_HOST\" port=\"$REMOTE_LOG_PORT\" protocol=\"tcp\" action.resumeRetryCount=\"100\" queue.type=\"LinkedList\" queue.size=\"1000\")"
 else
@@ -542,7 +549,6 @@ if (( ENABLE_LOG_PERMISSIONS )) && [[ -d /var/log ]]; then
 else
   skip "recursive /var/log changes need --enable-log-permissions after owner/mode review"
 fi
-[[ -d /etc/audit ]] && run find /etc/audit -type f \( -name '*.conf' -o -name '*.rules' \) -exec chmod u-x,g-wx,o-rwx {} +
 for tool in /sbin/auditctl /sbin/aureport /sbin/ausearch /sbin/autrace /sbin/auditd /sbin/augenrules; do [[ -e "$tool" ]] && run chmod go-w "$tool"; done
 for f in /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-; do [[ -e "$f" ]] && { run chown root:shadow "$f"; run chmod 0640 "$f"; }; done
 for f in /etc/security/opasswd /etc/security/opasswd.old; do [[ -e "$f" ]] && { run chown root:root "$f"; run chmod 0600 "$f"; }; done
