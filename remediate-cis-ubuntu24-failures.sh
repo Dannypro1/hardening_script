@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remediate non-reboot failures from 01-checks-3-.csv (CIS Ubuntu 24.04).
+# Remediate only non-reboot failures from 01-checks-4-.csv (CIS Ubuntu 24.04).
 # Default mode is a read-only preview. Review output before using --apply.
 set -Eeuo pipefail
 
@@ -25,8 +25,6 @@ JOURNAL_UPLOAD_URL="${JOURNAL_UPLOAD_URL:-}"
 JOURNAL_SERVER_KEY="${JOURNAL_SERVER_KEY:-}"
 JOURNAL_SERVER_CERT="${JOURNAL_SERVER_CERT:-}"
 JOURNAL_TRUSTED_CERT="${JOURNAL_TRUSTED_CERT:-}"
-GRUB_SUPERUSER="${GRUB_SUPERUSER:-}"
-GRUB_PASSWORD_HASH="${GRUB_PASSWORD_HASH:-}"
 SSH_PORT="${SSH_PORT:-22}"
 FIREWALL_ALLOW_TCP="${FIREWALL_ALLOW_TCP:-$SSH_PORT}"
 FIREWALL_ALLOW_UDP="${FIREWALL_ALLOW_UDP:-}"
@@ -56,7 +54,7 @@ CIS disk-full actions and must only be enabled after capacity review.
 Optional environment variables:
   NTP_SERVERS, FALLBACK_NTP_SERVERS, REMOTE_LOG_HOST, REMOTE_LOG_PORT
   JOURNAL_UPLOAD_URL, JOURNAL_SERVER_KEY, JOURNAL_SERVER_CERT
-  JOURNAL_TRUSTED_CERT, GRUB_SUPERUSER, GRUB_PASSWORD_HASH
+  JOURNAL_TRUSTED_CERT
   SSH_PORT, FIREWALL_ALLOW_TCP (space-separated), FIREWALL_ALLOW_UDP
 
 Examples:
@@ -206,10 +204,6 @@ else
 fi
 skip "35518/35521/35524/35528/35532 require a storage/repartitioning maintenance plan"
 
-# 35506, 35509, 35604-07 are intentionally excluded. Fully remediating loaded
-# kernel modules can require a reboot and may break Snap, storage, or networking.
-skip "kernel-module controls are excluded because this is a no-reboot script"
-
 # 35538-39
 if (( ENABLE_APPARMOR )); then
   have aa-enforce && run aa-enforce /etc/apparmor.d/* || skip "aa-enforce is unavailable"
@@ -217,22 +211,11 @@ else
   skip "AppArmor enforcement needs --enable-apparmor and application compatibility testing"
 fi
 
-# 35540
-if [[ -n "$GRUB_SUPERUSER" && -n "$GRUB_PASSWORD_HASH" ]]; then
-  [[ "$GRUB_PASSWORD_HASH" == grub.pbkdf2.* ]] || { echo "GRUB_PASSWORD_HASH is not a GRUB PBKDF2 hash" >&2; exit 1; }
-  write_file /etc/grub.d/01_cis_users 0700 "#!/bin/sh
-cat <<'GRUB_EOF'
-set superusers=\"$GRUB_SUPERUSER\"
-password_pbkdf2 $GRUB_SUPERUSER $GRUB_PASSWORD_HASH
-GRUB_EOF"
-else
-  skip "bootloader password needs GRUB_SUPERUSER and GRUB_PASSWORD_HASH"
-fi
 # 35543, 35545
 write_file /etc/security/limits.d/60-cis-core.conf 0644 '* hard core 0'
 write_file /etc/sysctl.d/60-cis-core.conf 0644 'fs.suid_dumpable = 0'
 if (( ENABLE_NETWORK_HARDENING )); then
-  write_file /etc/sysctl.d/61-cis-network.conf 0644 'net.ipv4.conf.all.log_martians = 1
+  write_file /etc/sysctl.d/62-cis-log-martians.conf 0644 'net.ipv4.conf.all.log_martians = 1
 net.ipv4.conf.default.log_martians = 1'
 else
   skip "live network sysctls need --enable-network-hardening after routing review"
@@ -383,24 +366,16 @@ case "$FIREWALL_BACKEND" in
   none) skip "firewall remediation needs one explicit --firewall-backend choice" ;;
 esac
 
-# 35640, 35644, 35646-50, 35652-53, 35655-61
+# 35640, 35644, 35646-47, 35652, 35654, 35657
 if (( ENABLE_SSH_HARDENING )) && [[ -d /etc/ssh ]]; then
-  write_file /etc/ssh/sshd_config.d/00-cis-hardening.conf 0600 'Banner /etc/issue.net
+  write_file /etc/ssh/sshd_config.d/01-cis-remaining.conf 0600 'Banner /etc/issue.net
 ClientAliveInterval 15
 ClientAliveCountMax 3
 DisableForwarding yes
-GSSAPIAuthentication no
-HostbasedAuthentication no
-IgnoreRhosts yes
 LoginGraceTime 60
-LogLevel VERBOSE
-MaxAuthTries 4
-MaxSessions 10
+MACs -hmac-md5,hmac-md5-96,hmac-ripemd160,hmac-sha1,hmac-sha1-96,umac-64@openssh.com,umac-128@openssh.com,hmac-md5-etm@openssh.com,hmac-md5-96-etm@openssh.com,hmac-ripemd160-etm@openssh.com,hmac-sha1-etm@openssh.com,hmac-sha1-96-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-64-etm@openssh.com,umac-128-etm@openssh.com
 MaxStartups 10:30:60
-PermitEmptyPasswords no
-PermitRootLogin no
-PermitUserEnvironment no
-UsePAM yes'
+'
   [[ -e /etc/ssh/sshd_config ]] && { run chown root:root /etc/ssh/sshd_config; run chmod 0600 /etc/ssh/sshd_config; }
   if (( APPLY )) && have sshd; then
     if sshd -t; then systemd_available && systemctl reload ssh.service 2>/dev/null || true
@@ -536,9 +511,8 @@ for tool in /sbin/auditctl /sbin/aureport /sbin/ausearch /sbin/autrace /sbin/aud
 for f in /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-; do [[ -e "$f" ]] && { run chown root:shadow "$f"; run chmod 0640 "$f"; }; done
 for f in /etc/security/opasswd /etc/security/opasswd.old; do [[ -e "$f" ]] && { run chown root:root "$f"; run chmod 0600 "$f"; }; done
 
-# 35725-26 are intentionally excluded because kernel audit boot parameters
-# require a reboot. Remaining audit controls can be loaded on a mutable daemon.
-skip "audit=1 and audit_backlog_limit boot controls are excluded because they require reboot"
+# Boot-time audit parameters are omitted. Remaining audit controls can be
+# loaded without reboot when the running audit rule set is mutable.
 if (( ENABLE_AUDIT_HARDENING )) && audit_is_immutable; then
   skip "audit rules are immutable; changing them would require reboot"
 elif (( ENABLE_AUDIT_HARDENING )) && [[ -d /etc/audit || $(dpkg-query -W -f='${Status}' auditd 2>/dev/null || true) == *installed* ]]; then
@@ -599,7 +573,17 @@ elif (( ENABLE_AUDIT_HARDENING )) && [[ -d /etc/audit || $(dpkg-query -W -f='${S
     backup /etc/audit/rules.d/60-cis.rules
     sed -i '/-F arch=b32/d' /etc/audit/rules.d/60-cis.rules
   fi
-  if (( APPLY )) && have augenrules; then augenrules --check; augenrules --load || skip "audit rules require reboot or architecture-specific tuning"; fi
+  if (( APPLY )) && have augenrules; then
+    if ! augenrules --check || ! augenrules --load; then
+      if [[ -e "$BACKUP_DIR/etc/audit/rules.d/60-cis.rules" ]]; then
+        cp -a "$BACKUP_DIR/etc/audit/rules.d/60-cis.rules" /etc/audit/rules.d/60-cis.rules
+      else
+        rm -f /etc/audit/rules.d/60-cis.rules
+      fi
+      augenrules --load >/dev/null 2>&1 || true
+      skip "audit rules failed live validation/loading and were rolled back"
+    fi
+  fi
 elif (( ENABLE_AUDIT_HARDENING )); then
   skip "auditd is not installed; install it under your package-change process before applying audit rules"
 else
@@ -623,9 +607,6 @@ elif (( ENABLE_AUDIT_HARDENING )); then
 fi
 
 if (( APPLY )); then
-  if [[ -n "$GRUB_SUPERUSER" && -n "$GRUB_PASSWORD_HASH" ]]; then
-    have update-grub && run update-grub
-  fi
   systemd_available && run systemctl daemon-reload
 fi
 
