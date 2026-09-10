@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Remediate automatable failures from 01-checks-2-.csv (CIS Ubuntu 24.04).
+# Remediate non-reboot failures from 01-checks-3-.csv (CIS Ubuntu 24.04).
 # Default mode is a read-only preview. Review output before using --apply.
 set -Eeuo pipefail
 
 APPLY=0
-ENABLE_MODULE_HARDENING=0
 ENABLE_PAM_HARDENING=0
 ENABLE_APPARMOR=0
 REMOVE_UNUSED_PACKAGES=0
@@ -41,9 +40,8 @@ The default is a dry run. Options:
   --enable-mount-hardening     Change/remount existing separate filesystems
   --enable-network-hardening   Apply live network sysctl changes
   --enable-ssh-hardening       Change, validate, and reload OpenSSH settings
-  --enable-audit-hardening     Add audit rules and GRUB audit parameters
+  --enable-audit-hardening     Add live audit rules (boot parameters excluded)
   --enable-log-permissions     Tighten permissions recursively under /var/log
-  --enable-module-hardening    Disable failed filesystem/network modules
   --enable-pam-hardening       Enable PAM, password aging, timeout, and root umask policy
   --enable-apparmor            Put all loaded AppArmor profiles in enforce mode
   --remove-unused-packages     Purge GDM, rsync, telnet, and FTP clients
@@ -71,7 +69,6 @@ EOF
 while (($#)); do
   case "$1" in
     --apply) APPLY=1 ;;
-    --enable-module-hardening) ENABLE_MODULE_HARDENING=1 ;;
     --enable-pam-hardening) ENABLE_PAM_HARDENING=1 ;;
     --enable-apparmor) ENABLE_APPARMOR=1 ;;
     --remove-unused-packages) REMOVE_UNUSED_PACKAGES=1 ;;
@@ -94,7 +91,7 @@ done
 case "$FIREWALL_BACKEND" in none|nftables|ufw|iptables) ;; *) echo "Invalid firewall backend" >&2; exit 2 ;; esac
 if (( APPLY )) && {
   (( ENABLE_MOUNT_HARDENING || ENABLE_NETWORK_HARDENING || ENABLE_SSH_HARDENING ||
-     ENABLE_AUDIT_HARDENING || ENABLE_LOG_PERMISSIONS || ENABLE_MODULE_HARDENING ||
+     ENABLE_AUDIT_HARDENING || ENABLE_LOG_PERMISSIONS ||
      ENABLE_PAM_HARDENING || ENABLE_APPARMOR || REMOVE_UNUSED_PACKAGES || STRICT_EGRESS )) ||
   [[ "$FIREWALL_BACKEND" != none ]]
 }; then
@@ -165,6 +162,9 @@ replace_setting() {
 }
 have() { command -v "$1" >/dev/null 2>&1; }
 systemd_available() { [[ -d /run/systemd/system ]] && have systemctl; }
+audit_is_immutable() {
+  have auditctl && auditctl -s 2>/dev/null | awk '$1 == "enabled" && $2 == "2" {found=1} END {exit !found}'
+}
 
 log "Mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
 log "Production guard: disruptive categories are opt-in and require --acknowledge-risk when applied."
@@ -206,23 +206,9 @@ else
 fi
 skip "35518/35521/35524/35528/35532 require a storage/repartitioning maintenance plan"
 
-# 35506, 35509, 35604-07. SquashFS is commonly required by Snap.
-disable_module() {
-  local mod="$1" fs="${1//-/_}"
-  if findmnt -rn -t "$fs" | grep -q .; then skip "$mod is backing a mounted filesystem"; return; fi
-  write_file "/etc/modprobe.d/60-cis-$mod.conf" 0644 "install $mod /bin/false
-blacklist $mod"
-  if lsmod 2>/dev/null | awk '{print $1}' | grep -qx "${mod//-/_}"; then
-    run modprobe -r "$mod" || skip "$mod is loaded and could not be safely unloaded; reboot may be required"
-  fi
-}
-if (( ENABLE_MODULE_HARDENING )); then
-  for module in squashfs afs ceph cifs exfat ext fat fscache fuse gfs2 nfs_common nfsd smbfs_common dccp tipc rds sctp; do
-    disable_module "$module"
-  done
-else
-  skip "module hardening needs --enable-module-hardening (review Snap, NFS, SMB, FUSE, SCTP dependencies)"
-fi
+# 35506, 35509, 35604-07 are intentionally excluded. Fully remediating loaded
+# kernel modules can require a reboot and may break Snap, storage, or networking.
+skip "kernel-module controls are excluded because this is a no-reboot script"
 
 # 35538-39
 if (( ENABLE_APPARMOR )); then
@@ -246,20 +232,8 @@ fi
 write_file /etc/security/limits.d/60-cis-core.conf 0644 '* hard core 0'
 write_file /etc/sysctl.d/60-cis-core.conf 0644 'fs.suid_dumpable = 0'
 if (( ENABLE_NETWORK_HARDENING )); then
-  write_file /etc/sysctl.d/61-cis-network.conf 0644 'net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
-net.ipv4.conf.all.log_martians = 1
-net.ipv4.conf.default.log_martians = 1
-net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_source_route = 0
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.conf.default.accept_ra = 0'
+  write_file /etc/sysctl.d/61-cis-network.conf 0644 'net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1'
 else
   skip "live network sysctls need --enable-network-hardening after routing review"
 fi
@@ -409,15 +383,24 @@ case "$FIREWALL_BACKEND" in
   none) skip "firewall remediation needs one explicit --firewall-backend choice" ;;
 esac
 
-# 35640, 35644, 35646-47, 35652, 35654, 35657
+# 35640, 35644, 35646-50, 35652-53, 35655-61
 if (( ENABLE_SSH_HARDENING )) && [[ -d /etc/ssh ]]; then
   write_file /etc/ssh/sshd_config.d/00-cis-hardening.conf 0600 'Banner /etc/issue.net
 ClientAliveInterval 15
 ClientAliveCountMax 3
 DisableForwarding yes
+GSSAPIAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
 LoginGraceTime 60
-MACs -hmac-md5,hmac-md5-96,hmac-ripemd160,hmac-sha1-96,umac-64@openssh.com,hmac-md5-etm@openssh.com,hmac-md5-96-etm@openssh.com,hmac-ripemd160-etm@openssh.com,hmac-sha1-96-etm@openssh.com,umac-64-etm@openssh.com,umac-128-etm@openssh.com
-MaxStartups 10:30:60'
+LogLevel VERBOSE
+MaxAuthTries 4
+MaxSessions 10
+MaxStartups 10:30:60
+PermitEmptyPasswords no
+PermitRootLogin no
+PermitUserEnvironment no
+UsePAM yes'
   [[ -e /etc/ssh/sshd_config ]] && { run chown root:root /etc/ssh/sshd_config; run chmod 0600 /etc/ssh/sshd_config; }
   if (( APPLY )) && have sshd; then
     if sshd -t; then systemd_available && systemctl reload ssh.service 2>/dev/null || true
@@ -553,11 +536,12 @@ for tool in /sbin/auditctl /sbin/aureport /sbin/ausearch /sbin/autrace /sbin/aud
 for f in /etc/shadow /etc/shadow- /etc/gshadow /etc/gshadow-; do [[ -e "$f" ]] && { run chown root:shadow "$f"; run chmod 0640 "$f"; }; done
 for f in /etc/security/opasswd /etc/security/opasswd.old; do [[ -e "$f" ]] && { run chown root:root "$f"; run chmod 0600 "$f"; }; done
 
-# 35725-60: audit boot parameters, daemon policy, rules, and AIDE coverage.
-if (( ENABLE_AUDIT_HARDENING )) && { have update-grub || [[ -d /etc/default/grub.d ]]; }; then
-  write_file /etc/default/grub.d/60-cis-audit.cfg 0644 'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX audit=1 audit_backlog_limit=8192"'
-fi
-if (( ENABLE_AUDIT_HARDENING )) && [[ -d /etc/audit || $(dpkg-query -W -f='${Status}' auditd 2>/dev/null || true) == *installed* ]]; then
+# 35725-26 are intentionally excluded because kernel audit boot parameters
+# require a reboot. Remaining audit controls can be loaded on a mutable daemon.
+skip "audit=1 and audit_backlog_limit boot controls are excluded because they require reboot"
+if (( ENABLE_AUDIT_HARDENING )) && audit_is_immutable; then
+  skip "audit rules are immutable; changing them would require reboot"
+elif (( ENABLE_AUDIT_HARDENING )) && [[ -d /etc/audit || $(dpkg-query -W -f='${Status}' auditd 2>/dev/null || true) == *installed* ]]; then
   replace_setting /etc/audit/auditd.conf max_log_file_action keep_logs
   replace_setting /etc/audit/auditd.conf disk_full_action halt
   replace_setting /etc/audit/auditd.conf disk_error_action halt
@@ -619,7 +603,7 @@ if (( ENABLE_AUDIT_HARDENING )) && [[ -d /etc/audit || $(dpkg-query -W -f='${Sta
 elif (( ENABLE_AUDIT_HARDENING )); then
   skip "auditd is not installed; install it under your package-change process before applying audit rules"
 else
-  skip "audit and GRUB changes need --enable-audit-hardening after capacity and disk-full review"
+  skip "live audit changes need --enable-audit-hardening after capacity and disk-full review"
 fi
 if (( ENABLE_AUDIT_HARDENING )) && [[ -f /etc/aide/aide.conf ]]; then
   aide_lines="# Audit Tools"
@@ -639,7 +623,7 @@ elif (( ENABLE_AUDIT_HARDENING )); then
 fi
 
 if (( APPLY )); then
-  if (( ENABLE_AUDIT_HARDENING )) || [[ -n "$GRUB_SUPERUSER" && -n "$GRUB_PASSWORD_HASH" ]]; then
+  if [[ -n "$GRUB_SUPERUSER" && -n "$GRUB_PASSWORD_HASH" ]]; then
     have update-grub && run update-grub
   fi
   systemd_available && run systemctl daemon-reload
@@ -648,7 +632,7 @@ fi
 log "Completed. Planned/written configuration units: $CHANGED; skipped categories/items: $SKIPPED."
 if (( APPLY )); then
   log "Backups: $BACKUP_DIR"
-  log "Reboot is required for GRUB audit parameters and any loaded module changes. Re-run the original scanner afterward."
+  log "No reboot-required remediation is included. Re-run the original scanner afterward."
 else
   log "No changes were made. Review this output, then rerun with --apply and chosen opt-in flags."
 fi
